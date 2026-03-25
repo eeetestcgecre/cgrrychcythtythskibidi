@@ -15322,100 +15322,105 @@ function RoClothes(Player)
 			end
 
 			-- [[ Stomach Bulge – TorsoType 7 only ]]
-			-- Detects another character part entering from the bottom face of the
-			-- torso mesh and lerps the mesh size outward (Z forward + slight Y up),
-			-- then lerps back once the toucher leaves.
+			-- Polls each Heartbeat for OTHER characters whose HumanoidRootPart (or
+			-- LowerTorso/Torso) is overlapping the bottom half of this torso mesh.
+			-- When overlap is detected the mesh lerps outward (Z forward + slight Y);
+			-- when nothing is overlapping it lerps back to rest.
+			-- The bulge magnitude also scales with how deep the overlap is, so a
+			-- partial entry looks smaller than a full one.
 			if DataDetail.TorsoType == 7 and TORSO then
-				local StomachBulgeActive = {}      -- tracks active touchers so multiple
-				                                   -- simultaneous touches don't fight
 
-				-- Base size is whatever Function.Weld set on TORSO
-				local BASE_SIZE   = TORSO.Size
-				-- How much to swell: tune these to taste
-				local BULGE_Z     = 0.45   -- forward belly pop
-				local BULGE_Y     = 0.18   -- slight upward lift
-				local BULGE_SPEED = 0.35   -- seconds to reach full bulge
-				local RELAX_SPEED = 0.55   -- seconds to return to normal
+				-- ── tunables ─────────────────────────────────────────────────────
+				local BULGE_Z_MAX  = 0.50   -- max forward belly pop  (studs added to Z)
+				local BULGE_Y_MAX  = 0.20   -- max upward lift        (studs added to Y)
+				local LERP_SPEED   = 8      -- how fast size tracks target (per second)
+				local DETECT_NAMES = {      -- part names that count as "inside"
+					["HumanoidRootPart"] = true,
+					["LowerTorso"]       = true,
+					["Torso"]            = true,
+					["UpperTorso"]       = true,
+				}
+				-- ─────────────────────────────────────────────────────────────────
 
-				local tweenInfo_In  = TweenInfo.new(BULGE_SPEED, Enum.EasingStyle.Sine, Enum.EasingDirection.Out)
-				local tweenInfo_Out = TweenInfo.new(RELAX_SPEED, Enum.EasingStyle.Sine, Enum.EasingDirection.In)
+				local BASE_SIZE = TORSO.Size  -- captured once; never modified
+				local currentSize = BASE_SIZE -- tracks the live lerped size
 
-				local currentBulgeTween  -- reference so we can cancel mid-tween
-
-				local function isBottomEntry(toucherPart)
-					-- Project the toucher's world position into the torso's local space.
-					-- If local Y is below the torso centre by more than half its height,
-					-- the part came in through the bottom face.
-					local localPos = TORSO.CFrame:PointToObjectSpace(toucherPart.Position)
-					return localPos.Y < -(TORSO.Size.Y * 0.3)
+				-- Returns 0–1: how deeply `otherPart` overlaps the BOTTOM half of
+				-- TORSO in local space.  0 = no overlap, 1 = fully centred inside.
+				local function overlapDepth(otherPart)
+					if not TORSO.Parent then return 0 end
+					local localPos = TORSO.CFrame:PointToObjectSpace(otherPart.Position)
+					local halfH    = TORSO.Size.Y * 0.5
+					-- only care about the lower half (localPos.Y < 0)
+					if localPos.Y > 0 then return 0 end
+					-- lateral bounds check (X and Z must be inside the mesh footprint)
+					local halfX = TORSO.Size.X * 0.55
+					local halfZ = TORSO.Size.Z * 0.55
+					if math.abs(localPos.X) > halfX then return 0 end
+					if math.abs(localPos.Z) > halfZ then return 0 end
+					-- depth: 0 at bottom face, 1 at centre
+					local depth = math.clamp((-localPos.Y) / halfH, 0, 1)
+					return depth
 				end
 
-				local function isCharacterPart(part)
-					-- Only react to Humanoid-carrying models (other players / NPCs)
-					local model = part:FindFirstAncestorOfClass("Model")
-					if not model then return false end
-					if model == Character then return false end   -- ignore self
-					return model:FindFirstChildOfClass("Humanoid") ~= nil
-				end
+				local RS = game:GetService("RunService")
 
-				local function applyBulge()
-					if currentBulgeTween then currentBulgeTween:Cancel() end
+				local heartbeatConn = RS.Heartbeat:Connect(function(dt)
+					if not TORSO or not TORSO.Parent then return end
+
+					-- Find the strongest overlap across all other players/NPCs
+					local maxDepth = 0
+					for _, otherPlayer in ipairs(Players:GetPlayers()) do
+						if otherPlayer.Character and otherPlayer.Character ~= Character then
+							for partName, _ in pairs(DETECT_NAMES) do
+								local p = otherPlayer.Character:FindFirstChild(partName)
+								if p then
+									local d = overlapDepth(p)
+									if d > maxDepth then maxDepth = d end
+								end
+							end
+						end
+					end
+					-- Also scan workspace NPCs (Models with Humanoid but no Player)
+					for _, model in ipairs(workspace:GetChildren()) do
+						if model:IsA("Model") and model ~= Character and model:FindFirstChildOfClass("Humanoid") then
+							for partName, _ in pairs(DETECT_NAMES) do
+								local p = model:FindFirstChild(partName)
+								if p then
+									local d = overlapDepth(p)
+									if d > maxDepth then maxDepth = d end
+								end
+							end
+						end
+					end
+
+					-- Target size driven by depth
 					local targetSize = Vector3.new(
 						BASE_SIZE.X,
-						BASE_SIZE.Y + BULGE_Y,
-						BASE_SIZE.Z + BULGE_Z
+						BASE_SIZE.Y + BULGE_Y_MAX * maxDepth,
+						BASE_SIZE.Z + BULGE_Z_MAX * maxDepth
 					)
-					currentBulgeTween = TS:Create(TORSO, tweenInfo_In, {Size = targetSize})
-					currentBulgeTween:Play()
-				end
 
-				local function releaseBulge()
-					if currentBulgeTween then currentBulgeTween:Cancel() end
-					currentBulgeTween = TS:Create(TORSO, tweenInfo_Out, {Size = BASE_SIZE})
-					currentBulgeTween:Play()
-					-- Re-sync the weld C0 after the tween so position doesn't drift.
-					-- (Size changes don't move the weld anchor, but we refresh the
-					-- RealtimeUpdateList entry so the existing size-sync code stays happy.)
-					currentBulgeTween.Completed:Connect(function()
-						local entry = PlayerData[Data].CurrentPartList.RealtimeUpdateList.Mesh[TORSO]
-						if entry then
-							entry.Size = BASE_SIZE
-						end
-					end)
-				end
+					-- Smooth lerp toward target (frame-rate independent)
+					local alpha = math.clamp(LERP_SPEED * dt, 0, 1)
+					currentSize = currentSize:Lerp(targetSize, alpha)
 
-				local touchConn = TORSO.Touched:Connect(function(hit)
-					if not isCharacterPart(hit) then return end
-					if not isBottomEntry(hit) then return end
-					if StomachBulgeActive[hit] then return end  -- already tracked
-
-					StomachBulgeActive[hit] = true
-					applyBulge()
-				end)
-
-				local touchEndConn = TORSO.TouchEnded:Connect(function(hit)
-					if not StomachBulgeActive[hit] then return end
-					StomachBulgeActive[hit] = nil
-
-					-- Only relax if nothing else is still inside
-					if next(StomachBulgeActive) == nil then
-						releaseBulge()
+					-- Apply – guard MeshSizeLock so we don't fight the resize system
+					if PlayerData[Data] and PlayerData[Data].MeshSizeLock == false then
+						TORSO.Size = currentSize
 					end
 				end)
 
-				-- Clean up connections when the torso part is removed
+				-- Cleanup when torso is removed
 				local removeConn
 				removeConn = TORSO.AncestryChanged:Connect(function()
 					if TORSO.Parent == nil then
-						touchConn:Disconnect()
-						touchEndConn:Disconnect()
+						heartbeatConn:Disconnect()
 						removeConn:Disconnect()
-						if currentBulgeTween then currentBulgeTween:Cancel() end
 					end
 				end)
 
-				table.insert(AllConnect, touchConn)
-				table.insert(AllConnect, touchEndConn)
+				table.insert(AllConnect, heartbeatConn)
 				table.insert(AllConnect, removeConn)
 			end
 			-- [[ End Stomach Bulge ]]
